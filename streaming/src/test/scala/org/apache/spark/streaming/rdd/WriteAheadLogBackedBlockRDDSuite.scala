@@ -20,34 +20,43 @@ import java.io.File
 
 import scala.util.Random
 
-import com.google.common.io.Files
 import org.apache.hadoop.conf.Configuration
-import org.scalatest.{BeforeAndAfterAll, FunSuite}
+import org.scalatest.{BeforeAndAfterEach, BeforeAndAfterAll, FunSuite}
 
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.storage.{BlockId, BlockManager, StorageLevel, StreamBlockId}
 import org.apache.spark.streaming.util.{WriteAheadLogFileSegment, WriteAheadLogWriter}
+import org.apache.spark.util.Utils
 
-class WriteAheadLogBackedBlockRDDSuite extends FunSuite with BeforeAndAfterAll {
+class WriteAheadLogBackedBlockRDDSuite
+  extends FunSuite with BeforeAndAfterAll with BeforeAndAfterEach {
+
   val conf = new SparkConf()
     .setMaster("local[2]")
     .setAppName(this.getClass.getSimpleName)
+
   val hadoopConf = new Configuration()
 
   var sparkContext: SparkContext = null
   var blockManager: BlockManager = null
   var dir: File = null
 
+  override def beforeEach(): Unit = {
+    dir = Utils.createTempDir()
+  }
+
+  override def afterEach(): Unit = {
+    Utils.deleteRecursively(dir)
+  }
+
   override def beforeAll(): Unit = {
     sparkContext = new SparkContext(conf)
     blockManager = sparkContext.env.blockManager
-    dir = Files.createTempDir()
   }
 
   override def afterAll(): Unit = {
     // Copied from LocalSparkContext, simpler than to introduced test dependencies to core tests.
     sparkContext.stop()
-    dir.delete()
     System.clearProperty("spark.driver.port")
   }
 
@@ -80,7 +89,8 @@ class WriteAheadLogBackedBlockRDDSuite extends FunSuite with BeforeAndAfterAll {
    * @param numPartitionsInWAL Number of partitions to write to the Write Ahead Log
    * @param testStoreInBM Test whether blocks read from log are stored back into block manager
    */
-  private def testRDD(numPartitionsInBM: Int, numPartitionsInWAL: Int, testStoreInBM: Boolean = false) {
+  private def testRDD(
+      numPartitionsInBM: Int, numPartitionsInWAL: Int, testStoreInBM: Boolean = false) {
     val numBlocks = numPartitionsInBM + numPartitionsInWAL
     val data = Seq.fill(numBlocks, 10)(scala.util.Random.nextString(50))
 
@@ -104,7 +114,7 @@ class WriteAheadLogBackedBlockRDDSuite extends FunSuite with BeforeAndAfterAll {
       "Unexpected blocks in BlockManager"
     )
 
-    // Make sure that the right `numPartitionsInWAL` blocks are in write ahead logs, and other are not
+    // Make sure that the right `numPartitionsInWAL` blocks are in WALs, and other are not
     require(
       segments.takeRight(numPartitionsInWAL).forall(s =>
         new File(s.path.stripPrefix("file://")).exists()),
@@ -137,7 +147,7 @@ class WriteAheadLogBackedBlockRDDSuite extends FunSuite with BeforeAndAfterAll {
       blockIds: Seq[BlockId]
     ): Seq[WriteAheadLogFileSegment] = {
     require(blockData.size === blockIds.size)
-    val writer = new WriteAheadLogWriter(new File(dir, Random.nextString(10)).toString, hadoopConf)
+    val writer = new WriteAheadLogWriter(new File(dir, "logFile").toString, hadoopConf)
     val segments = blockData.zip(blockIds).map { case (data, id) =>
       writer.write(blockManager.dataSerialize(id, data.iterator))
     }
@@ -146,6 +156,6 @@ class WriteAheadLogBackedBlockRDDSuite extends FunSuite with BeforeAndAfterAll {
   }
 
   private def generateFakeSegments(count: Int): Seq[WriteAheadLogFileSegment] = {
-    Array.fill(count)(new WriteAheadLogFileSegment("random", 0l, 0))
+    Array.fill(count)(new WriteAheadLogFileSegment("random", 0L, 0))
   }
 }

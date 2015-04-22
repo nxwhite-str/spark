@@ -18,7 +18,7 @@
 package org.apache.spark.sql.catalyst.expressions.codegen
 
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.catalyst.types._
+import org.apache.spark.sql.types._
 
 
 /**
@@ -31,7 +31,7 @@ object GenerateProjection extends CodeGenerator[Seq[Expression], Projection] {
   import scala.reflect.runtime.universe._
 
   protected def canonicalize(in: Seq[Expression]): Seq[Expression] =
-    in.map(ExpressionCanonicalizer(_))
+    in.map(ExpressionCanonicalizer.execute)
 
   protected def bind(in: Seq[Expression], inputSchema: Seq[Attribute]): Seq[Expression] =
     in.map(BindReferences.bindReference(_, inputSchema))
@@ -77,14 +77,6 @@ object GenerateProjection extends CodeGenerator[Seq[Expression], Projection] {
         """.children : Seq[Tree]
     }
 
-    val iteratorFunction = {
-      val allColumns = (0 until expressions.size).map { i =>
-        val iLit = ru.Literal(Constant(i))
-        q"if(isNullAt($iLit)) { null } else { ${newTermName(s"c$i")} }"
-      }
-      q"override def iterator = Iterator[Any](..$allColumns)"
-    }
-
     val accessorFailure = q"""scala.sys.error("Invalid ordinal:" + i)"""
     val applyFunction = {
       val cases = (0 until expressions.size).map { i =>
@@ -119,36 +111,54 @@ object GenerateProjection extends CodeGenerator[Seq[Expression], Projection] {
 
     val specificAccessorFunctions = NativeType.all.map { dataType =>
       val ifStatements = expressions.zipWithIndex.flatMap {
-        case (e, i) if e.dataType == dataType =>
+        // getString() is not used by expressions
+        case (e, i) if e.dataType == dataType && dataType != StringType =>
           val elementName = newTermName(s"c$i")
           // TODO: The string of ifs gets pretty inefficient as the row grows in size.
           // TODO: Optional null checks?
           q"if(i == $i) return $elementName" :: Nil
         case _ => Nil
       }
-
-      q"""
-      override def ${accessorForType(dataType)}(i: Int):${termForType(dataType)} = {
-        ..$ifStatements;
-        $accessorFailure
-      }"""
+      dataType match {
+        // Row() need this interface to compile
+        case StringType =>
+          q"""
+          override def getString(i: Int): String = {
+            $accessorFailure
+          }"""
+        case other =>
+          q"""
+          override def ${accessorForType(dataType)}(i: Int): ${termForType(dataType)} = {
+            ..$ifStatements;
+            $accessorFailure
+          }"""
+      }
     }
 
     val specificMutatorFunctions = NativeType.all.map { dataType =>
       val ifStatements = expressions.zipWithIndex.flatMap {
-        case (e, i) if e.dataType == dataType =>
+        // setString() is not used by expressions
+        case (e, i) if e.dataType == dataType && dataType != StringType =>
           val elementName = newTermName(s"c$i")
           // TODO: The string of ifs gets pretty inefficient as the row grows in size.
           // TODO: Optional null checks?
           q"if(i == $i) { nullBits($i) = false; $elementName = value; return }" :: Nil
         case _ => Nil
       }
-
-      q"""
-      override def ${mutatorForType(dataType)}(i: Int, value: ${termForType(dataType)}): Unit = {
-        ..$ifStatements;
-        $accessorFailure
-      }"""
+      dataType match {
+        case StringType =>
+          // MutableRow() need this interface to compile
+          q"""
+          override def setString(i: Int, value: String) {
+            $accessorFailure
+          }"""
+        case other =>
+          q"""
+          override def ${mutatorForType(dataType)}(i: Int, value: ${termForType(dataType)}) {
+            ..$ifStatements;
+            $accessorFailure
+          }"""
+      }
     }
 
     val hashValues = expressions.zipWithIndex.map { case (e,i) =>
@@ -191,20 +201,26 @@ object GenerateProjection extends CodeGenerator[Seq[Expression], Projection] {
         }
       """
 
+    val allColumns = (0 until expressions.size).map { i =>
+      val iLit = ru.Literal(Constant(i))
+      q"if(isNullAt($iLit)) { null } else { ${newTermName(s"c$i")} }"
+    }
+
     val copyFunction =
-      q"""
-        override def copy() = new $genericRowType(this.toArray)
-      """
+      q"override def copy() = new $genericRowType(Array[Any](..$allColumns))"
+
+    val toSeqFunction =
+      q"override def toSeq: Seq[Any] = Seq(..$allColumns)"
 
     val classBody =
       nullFunctions ++ (
         lengthDef +:
-        iteratorFunction +:
         applyFunction +:
         updateFunction +:
         equalsFunction +:
         hashCodeFunction +:
         copyFunction +:
+        toSeqFunction +:
         (tupleElements ++ specificAccessorFunctions ++ specificMutatorFunctions))
 
     val code = q"""

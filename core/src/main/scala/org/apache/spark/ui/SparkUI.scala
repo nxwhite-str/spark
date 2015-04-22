@@ -55,14 +55,12 @@ private[spark] class SparkUI private (
     attachTab(new ExecutorsTab(this))
     attachHandler(createStaticHandler(SparkUI.STATIC_RESOURCE_DIR, "/static"))
     attachHandler(createRedirectHandler("/", "/jobs", basePath = basePath))
-    attachHandler(
-      createRedirectHandler("/stages/stage/kill", "/stages", stagesTab.handleKillRequest))
-    // If the UI is live, then serve
-    sc.foreach { _.env.metricsSystem.getServletHandlers.foreach(attachHandler) }
+    attachHandler(createRedirectHandler(
+      "/stages/stage/kill", "/stages", stagesTab.handleKillRequest, httpMethod = "POST"))
   }
   initialize()
 
-  def getAppName = appName
+  def getAppName: String = appName
 
   /** Set the app name for this UI. */
   def setAppName(name: String) {

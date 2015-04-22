@@ -22,7 +22,7 @@ import java.nio.ByteBuffer
 import org.scalatest.FunSuite
 
 import org.apache.spark.sql.catalyst.expressions.GenericMutableRow
-import org.apache.spark.sql.catalyst.types.DataType
+import org.apache.spark.sql.types.DataType
 
 class TestNullableColumnAccessor[T <: DataType, JvmType](
     buffer: ByteBuffer,
@@ -31,7 +31,8 @@ class TestNullableColumnAccessor[T <: DataType, JvmType](
   with NullableColumnAccessor
 
 object TestNullableColumnAccessor {
-  def apply[T <: DataType, JvmType](buffer: ByteBuffer, columnType: ColumnType[T, JvmType]) = {
+  def apply[T <: DataType, JvmType](buffer: ByteBuffer, columnType: ColumnType[T, JvmType])
+    : TestNullableColumnAccessor[T, JvmType] = {
     // Skips the column type ID
     buffer.getInt()
     new TestNullableColumnAccessor(buffer, columnType)
@@ -42,7 +43,8 @@ class NullableColumnAccessorSuite extends FunSuite {
   import ColumnarTestUtils._
 
   Seq(
-    INT, LONG, SHORT, BOOLEAN, BYTE, STRING, DOUBLE, FLOAT, BINARY, GENERIC, DATE, TIMESTAMP
+    INT, LONG, SHORT, BOOLEAN, BYTE, STRING, DOUBLE, FLOAT, FIXED_DECIMAL(15, 10), BINARY, GENERIC,
+    DATE, TIMESTAMP
   ).foreach {
     testNullableColumnAccessor(_)
   }

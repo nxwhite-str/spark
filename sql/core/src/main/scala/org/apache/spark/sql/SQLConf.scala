@@ -33,18 +33,38 @@ private[spark] object SQLConf {
   val DIALECT = "spark.sql.dialect"
 
   val PARQUET_BINARY_AS_STRING = "spark.sql.parquet.binaryAsString"
+  val PARQUET_INT96_AS_TIMESTAMP = "spark.sql.parquet.int96AsTimestamp"
   val PARQUET_CACHE_METADATA = "spark.sql.parquet.cacheMetadata"
   val PARQUET_COMPRESSION = "spark.sql.parquet.compression.codec"
   val PARQUET_FILTER_PUSHDOWN_ENABLED = "spark.sql.parquet.filterPushdown"
+  val PARQUET_USE_DATA_SOURCE_API = "spark.sql.parquet.useDataSourceApi"
+
+  val HIVE_VERIFY_PARTITIONPATH = "spark.sql.hive.verifyPartitionPath"
 
   val COLUMN_NAME_OF_CORRUPT_RECORD = "spark.sql.columnNameOfCorruptRecord"
+  val BROADCAST_TIMEOUT = "spark.sql.broadcastTimeout"
 
   // Options that control which operators can be chosen by the query planner.  These should be
   // considered hints and may be ignored by future versions of Spark SQL.
   val EXTERNAL_SORT = "spark.sql.planner.externalSort"
+  val SORTMERGE_JOIN = "spark.sql.planner.sortMergeJoin"
 
   // This is only used for the thriftserver
   val THRIFTSERVER_POOL = "spark.sql.thriftserver.scheduler.pool"
+
+  // This is used to set the default data source
+  val DEFAULT_DATA_SOURCE_NAME = "spark.sql.sources.default"
+  // This is used to control the when we will split a schema's JSON string to multiple pieces
+  // in order to fit the JSON string in metastore's table property (by default, the value has
+  // a length restriction of 4000 characters). We will split the JSON string of a schema
+  // to its length exceeds the threshold.
+  val SCHEMA_STRING_LENGTH_THRESHOLD = "spark.sql.sources.schemaStringLengthThreshold"
+
+  // Whether to perform eager analysis when constructing a dataframe.
+  // Set to false when debugging requires the ability to look at invalid query plans.
+  val DATAFRAME_EAGER_ANALYSIS = "spark.sql.eagerAnalysis"
+
+  val USE_SQL_SERIALIZER2 = "spark.sql.useSerializer2"
 
   object Deprecated {
     val MAPRED_REDUCE_TASKS = "mapred.reduce.tasks"
@@ -52,15 +72,15 @@ private[spark] object SQLConf {
 }
 
 /**
- * A trait that enables the setting and getting of mutable config parameters/hints.
+ * A class that enables the setting and getting of mutable config parameters/hints.
  *
  * In the presence of a SQLContext, these can be set and queried by passing SET commands
- * into Spark SQL's query functions (i.e. sql()). Otherwise, users of this trait can
- * modify the hints by programmatically calling the setters and getters of this trait.
+ * into Spark SQL's query functions (i.e. sql()). Otherwise, users of this class can
+ * modify the hints by programmatically calling the setters and getters of this class.
  *
  * SQLConf is thread-safe (internally synchronized, so safe to be used in multiple threads).
  */
-private[sql] trait SQLConf {
+private[sql] class SQLConf extends Serializable {
   import SQLConf._
 
   /** Only low degree of contention is expected for conf, thus NOT using ConcurrentHashMap. */
@@ -100,8 +120,23 @@ private[sql] trait SQLConf {
   private[spark] def parquetFilterPushDown =
     getConf(PARQUET_FILTER_PUSHDOWN_ENABLED, "false").toBoolean
 
+  /** When true uses Parquet implementation based on data source API */
+  private[spark] def parquetUseDataSourceApi =
+    getConf(PARQUET_USE_DATA_SOURCE_API, "true").toBoolean
+
+  /** When true uses verifyPartitionPath to prune the path which is not exists. */
+  private[spark] def verifyPartitionPath =
+    getConf(HIVE_VERIFY_PARTITIONPATH, "true").toBoolean
+
   /** When true the planner will use the external sort, which may spill to disk. */
   private[spark] def externalSortEnabled: Boolean = getConf(EXTERNAL_SORT, "false").toBoolean
+
+  /**
+   * Sort merge join would sort the two side of join first, and then iterate both sides together
+   * only once to get all matches. Using sort merge join can save a lot of memory usage compared
+   * to HashJoin.
+   */
+  private[spark] def sortMergeJoinEnabled: Boolean = getConf(SORTMERGE_JOIN, "false").toBoolean
 
   /**
    * When set to true, Spark SQL will use the Scala compiler at runtime to generate custom bytecode
@@ -113,6 +148,8 @@ private[sql] trait SQLConf {
    * Defaults to false as this feature is currently experimental.
    */
   private[spark] def codegenEnabled: Boolean = getConf(CODEGEN_ENABLED, "false").toBoolean
+
+  private[spark] def useSqlSerializer2: Boolean = getConf(USE_SQL_SERIALIZER2, "true").toBoolean
 
   /**
    * Upper bound on the sizes (in bytes) of the tables qualified for the auto conversion to
@@ -140,6 +177,12 @@ private[sql] trait SQLConf {
     getConf(PARQUET_BINARY_AS_STRING, "false").toBoolean
 
   /**
+   * When set to true, we always treat INT96Values in Parquet files as timestamp.
+   */
+  private[spark] def isParquetINT96AsTimestamp: Boolean =
+    getConf(PARQUET_INT96_AS_TIMESTAMP, "true").toBoolean
+
+  /**
    * When set to true, partition pruning for in-memory columnar tables is enabled.
    */
   private[spark] def inMemoryPartitionPruning: Boolean =
@@ -147,6 +190,23 @@ private[sql] trait SQLConf {
 
   private[spark] def columnNameOfCorruptRecord: String =
     getConf(COLUMN_NAME_OF_CORRUPT_RECORD, "_corrupt_record")
+
+  /**
+   * Timeout in seconds for the broadcast wait time in hash join
+   */
+  private[spark] def broadcastTimeout: Int =
+    getConf(BROADCAST_TIMEOUT, (5 * 60).toString).toInt
+
+  private[spark] def defaultDataSourceName: String =
+    getConf(DEFAULT_DATA_SOURCE_NAME, "org.apache.spark.sql.parquet")
+
+  // Do not use a value larger than 4000 as the default value of this property.
+  // See the comments of SCHEMA_STRING_LENGTH_THRESHOLD above for more information.
+  private[spark] def schemaStringLengthThreshold: Int =
+    getConf(SCHEMA_STRING_LENGTH_THRESHOLD, "4000").toInt
+
+  private[spark] def dataFrameEagerAnalysis: Boolean =
+    getConf(DATAFRAME_EAGER_ANALYSIS, "true").toBoolean
 
   /** ********************** SQLConf functionality methods ************ */
 
@@ -180,6 +240,10 @@ private[sql] trait SQLConf {
    * This creates a new copy of the config properties in the form of a Map.
    */
   def getAllConfs: immutable.Map[String, String] = settings.synchronized { settings.toMap }
+
+  private[spark] def unsetConf(key: String) {
+    settings -= key
+  }
 
   private[spark] def clear() {
     settings.clear()

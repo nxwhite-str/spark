@@ -33,7 +33,7 @@ class DummyBroadcastClass(rdd: RDD[Int]) extends Serializable {
   val broadcast = rdd.context.broadcast(list)
   val bid = broadcast.id
 
-  def doSomething() = {
+  def doSomething(): Set[(Int, Boolean)] = {
     rdd.map { x =>
       val bm = SparkEnv.get.blockManager
       // Check if broadcast block was fetched
@@ -168,6 +168,15 @@ class BroadcastSuite extends FunSuite with LocalSparkContext {
   test("Using broadcast after destroy prints callsite") {
     sc = new SparkContext("local", "test")
     testPackage.runCallSiteTest(sc)
+  }
+
+  test("Broadcast variables cannot be created after SparkContext is stopped (SPARK-5065)") {
+    sc = new SparkContext("local", "test")
+    sc.stop()
+    val thrown = intercept[IllegalStateException] {
+      sc.broadcast(Seq(1, 2, 3))
+    }
+    assert(thrown.getMessage.toLowerCase.contains("stopped"))
   }
 
   /**
@@ -349,8 +358,7 @@ class BroadcastSuite extends FunSuite with LocalSparkContext {
 package object testPackage extends Assertions {
 
   def runCallSiteTest(sc: SparkContext) {
-    val rdd = sc.makeRDD(Array(1, 2, 3, 4), 2)
-    val broadcast = sc.broadcast(rdd)
+    val broadcast = sc.broadcast(Array(1, 2, 3, 4))
     broadcast.destroy()
     val thrown = intercept[SparkException] { broadcast.value }
     assert(thrown.getMessage.contains("BroadcastSuite.scala"))

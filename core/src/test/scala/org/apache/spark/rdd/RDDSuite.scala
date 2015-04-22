@@ -17,6 +17,10 @@
 
 package org.apache.spark.rdd
 
+import java.io.{ObjectInputStream, ObjectOutputStream, IOException}
+
+import com.esotericsoftware.kryo.KryoException
+
 import scala.collection.mutable.{ArrayBuffer, HashMap}
 import scala.collection.JavaConverters._
 import scala.reflect.ClassTag
@@ -48,6 +52,7 @@ class RDDSuite extends FunSuite with SharedSparkContext {
     assert(nums.glom().map(_.toList).collect().toList === List(List(1, 2), List(3, 4)))
     assert(nums.collect({ case i if i >= 3 => i.toString }).collect().toList === List("3", "4"))
     assert(nums.keyBy(_.toString).collect().toList === List(("1", 1), ("2", 2), ("3", 3), ("4", 4)))
+    assert(!nums.isEmpty())
     assert(nums.max() === 4)
     assert(nums.min() === 1)
     val partitionSums = nums.mapPartitions(iter => Iterator(iter.reduceLeft(_ + _)))
@@ -77,7 +82,7 @@ class RDDSuite extends FunSuite with SharedSparkContext {
 
   test("countApproxDistinct") {
 
-    def error(est: Long, size: Long) = math.abs(est - size) / size.toDouble
+    def error(est: Long, size: Long): Double = math.abs(est - size) / size.toDouble
 
     val size = 1000
     val uniformDistro = for (i <- 1 to 5000) yield i % size
@@ -95,7 +100,7 @@ class RDDSuite extends FunSuite with SharedSparkContext {
   }
 
   test("partitioner aware union") {
-    def makeRDDWithPartitioner(seq: Seq[Int]) = {
+    def makeRDDWithPartitioner(seq: Seq[Int]): RDD[Int] = {
       sc.makeRDD(seq, 1)
         .map(x => (x, null))
         .partitionBy(new HashPartitioner(2))
@@ -152,6 +157,24 @@ class RDDSuite extends FunSuite with SharedSparkContext {
     assert(result.toSet === Set(("a", 6), ("b", 2), ("c", 5)))
   }
 
+  test("treeAggregate") {
+    val rdd = sc.makeRDD(-1000 until 1000, 10)
+    def seqOp: (Long, Int) => Long = (c: Long, x: Int) => c + x
+    def combOp: (Long, Long) => Long = (c1: Long, c2: Long) => c1 + c2
+    for (depth <- 1 until 10) {
+      val sum = rdd.treeAggregate(0L)(seqOp, combOp, depth)
+      assert(sum === -1000L)
+    }
+  }
+
+  test("treeReduce") {
+    val rdd = sc.makeRDD(-1000 until 1000, 10)
+    for (depth <- 1 until 10) {
+      val sum = rdd.treeReduce(_ + _, depth)
+      assert(sum === -1000)
+    }
+  }
+
   test("basic caching") {
     val rdd = sc.makeRDD(Array(1, 2, 3, 4), 2).cache()
     assert(rdd.collect().toList === List(1, 2, 3, 4))
@@ -181,7 +204,7 @@ class RDDSuite extends FunSuite with SharedSparkContext {
     assert(empty.collect().size === 0)
 
     val thrown = intercept[UnsupportedOperationException]{
-      empty.reduce(_+_)
+      empty.reduce(_ + _)
     }
     assert(thrown.getMessage.contains("empty"))
 
@@ -294,11 +317,11 @@ class RDDSuite extends FunSuite with SharedSparkContext {
   test("coalesced RDDs with locality") {
     val data3 = sc.makeRDD(List((1,List("a","c")), (2,List("a","b","c")), (3,List("b"))))
     val coal3 = data3.coalesce(3)
-    val list3 = coal3.partitions.map(p => p.asInstanceOf[CoalescedRDDPartition].preferredLocation)
+    val list3 = coal3.partitions.flatMap(_.asInstanceOf[CoalescedRDDPartition].preferredLocation)
     assert(list3.sorted === Array("a","b","c"), "Locality preferences are dropped")
 
     // RDD with locality preferences spread (non-randomly) over 6 machines, m0 through m5
-    val data = sc.makeRDD((1 to 9).map(i => (i, (i to (i+2)).map{ j => "m" + (j%6)})))
+    val data = sc.makeRDD((1 to 9).map(i => (i, (i to (i + 2)).map{ j => "m" + (j%6)})))
     val coalesced1 = data.coalesce(3)
     assert(coalesced1.collect().toList.sorted === (1 to 9).toList, "Data got *lost* in coalescing")
 
@@ -539,6 +562,14 @@ class RDDSuite extends FunSuite with SharedSparkContext {
     assert(sortedTopK.size === 5)
     assert(sortedTopK === Array(10, 9, 8, 7, 6))
     assert(sortedTopK === nums.sorted(ord).take(5))
+  }
+
+  test("isEmpty") {
+    assert(sc.emptyRDD.isEmpty())
+    assert(sc.parallelize(Seq[Int]()).isEmpty())
+    assert(!sc.parallelize(Seq(1)).isEmpty())
+    assert(sc.parallelize(Seq(1,2,3), 3).filter(_ < 0).isEmpty())
+    assert(!sc.parallelize(Seq(1,2,3), 3).filter(_ > 1).isEmpty())
   }
 
   test("sample preserves partitioner") {
@@ -887,6 +918,25 @@ class RDDSuite extends FunSuite with SharedSparkContext {
     assert(ancestors6.count(_.isInstanceOf[CyclicalDependencyRDD[_]]) === 3)
   }
 
+  test("task serialization exception should not hang scheduler") {
+    class BadSerializable extends Serializable {
+      @throws(classOf[IOException])
+      private def writeObject(out: ObjectOutputStream): Unit =
+        throw new KryoException("Bad serialization")
+
+      @throws(classOf[IOException])
+      private def readObject(in: ObjectInputStream): Unit = {}
+    }
+    // Note that in the original bug, SPARK-4349, that this verifies, the job would only hang if
+    // there were more threads in the Spark Context than there were number of objects in this
+    // sequence.
+    intercept[Throwable] {
+      sc.parallelize(Seq(new BadSerializable, new BadSerializable)).collect()
+    }
+    // Check that the context has not crashed
+    sc.parallelize(1 to 100).map(x => x*2).collect
+  }
+
   /** A contrived RDD that allows the manual addition of dependencies after creation. */
   private class CyclicalDependencyRDD[T: ClassTag] extends RDD[T](sc, Nil) {
     private val mutableDependencies: ArrayBuffer[Dependency[_]] = ArrayBuffer.empty
@@ -897,4 +947,45 @@ class RDDSuite extends FunSuite with SharedSparkContext {
       mutableDependencies += dep
     }
   }
+
+  test("nested RDDs are not supported (SPARK-5063)") {
+    val rdd: RDD[Int] = sc.parallelize(1 to 100)
+    val rdd2: RDD[Int] = sc.parallelize(1 to 100)
+    val thrown = intercept[SparkException] {
+      val nestedRDD: RDD[RDD[Int]] = rdd.mapPartitions { x => Seq(rdd2.map(x => x)).iterator }
+      nestedRDD.count()
+    }
+    assert(thrown.getMessage.contains("SPARK-5063"))
+  }
+
+  test("actions cannot be performed inside of transformations (SPARK-5063)") {
+    val rdd: RDD[Int] = sc.parallelize(1 to 100)
+    val rdd2: RDD[Int] = sc.parallelize(1 to 100)
+    val thrown = intercept[SparkException] {
+      rdd.map(x => x * rdd2.count).collect()
+    }
+    assert(thrown.getMessage.contains("SPARK-5063"))
+  }
+
+  test("cannot run actions after SparkContext has been stopped (SPARK-5063)") {
+    val existingRDD = sc.parallelize(1 to 100)
+    sc.stop()
+    val thrown = intercept[IllegalStateException] {
+      existingRDD.count()
+    }
+    assert(thrown.getMessage.contains("shutdown"))
+  }
+
+  test("cannot call methods on a stopped SparkContext (SPARK-5063)") {
+    sc.stop()
+    def assertFails(block: => Any): Unit = {
+      val thrown = intercept[IllegalStateException] {
+        block
+      }
+      assert(thrown.getMessage.contains("stopped"))
+    }
+    assertFails { sc.parallelize(1 to 100) }
+    assertFails { sc.textFile("/nonexistent-path") }
+  }
+
 }
