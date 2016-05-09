@@ -17,23 +17,31 @@
 
 package org.apache.spark.streaming.kafka
 
-import scala.util.control.NonFatal
-import scala.util.Random
-import scala.collection.mutable.ArrayBuffer
 import java.util.Properties
+
+import scala.collection.JavaConverters._
+import scala.collection.mutable.ArrayBuffer
+import scala.util.Random
+import scala.util.control.NonFatal
+
 import kafka.api._
-import kafka.common.{ErrorMapping, OffsetMetadataAndError, TopicAndPartition}
+import kafka.common.{ErrorMapping, OffsetAndMetadata, OffsetMetadataAndError, TopicAndPartition}
 import kafka.consumer.{ConsumerConfig, SimpleConsumer}
+
 import org.apache.spark.SparkException
+import org.apache.spark.annotation.DeveloperApi
 
 /**
+ * :: DeveloperApi ::
  * Convenience methods for interacting with a Kafka cluster.
+ * See <a href="https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol">
+ * A Guide To The Kafka Protocol</a> for more details on individual api calls.
  * @param kafkaParams Kafka <a href="http://kafka.apache.org/documentation.html#configuration">
  * configuration parameters</a>.
  *   Requires "metadata.broker.list" or "bootstrap.servers" to be set with Kafka broker(s),
  *   NOT zookeeper servers, specified in host1:port1,host2:port2 form
  */
-private[spark]
+@DeveloperApi
 class KafkaCluster(val kafkaParams: Map[String, String]) extends Serializable {
   import KafkaCluster.{Err, LeaderOffset, SimpleConsumerConfig}
 
@@ -112,7 +120,7 @@ class KafkaCluster(val kafkaParams: Map[String, String]) extends Serializable {
       r.flatMap { tm: TopicMetadata =>
         tm.partitionsMetadata.map { pm: PartitionMetadata =>
           TopicAndPartition(tm.topic, pm.partitionId)
-        }    
+        }
       }
     }
   }
@@ -159,7 +167,7 @@ class KafkaCluster(val kafkaParams: Map[String, String]) extends Serializable {
     ): Either[Err, Map[TopicAndPartition, LeaderOffset]] = {
     getLeaderOffsets(topicAndPartitions, before, 1).right.map { r =>
       r.map { kv =>
-        // mapValues isnt serializable, see SI-7005
+        // mapValues isn't serializable, see SI-7005
         kv._1 -> kv._2.head
       }
     }
@@ -220,25 +228,42 @@ class KafkaCluster(val kafkaParams: Map[String, String]) extends Serializable {
   // https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-OffsetCommit/FetchAPI
   // scalastyle:on
 
-  /** Requires Kafka >= 0.8.1.1 */
+  // this 0 here indicates api version, in this case the original ZK backed api.
+  private def defaultConsumerApiVersion: Short = 0
+
+  /** Requires Kafka >= 0.8.1.1.  Defaults to the original ZooKeeper backed api version. */
   def getConsumerOffsets(
       groupId: String,
       topicAndPartitions: Set[TopicAndPartition]
+    ): Either[Err, Map[TopicAndPartition, Long]] =
+    getConsumerOffsets(groupId, topicAndPartitions, defaultConsumerApiVersion)
+
+  def getConsumerOffsets(
+      groupId: String,
+      topicAndPartitions: Set[TopicAndPartition],
+      consumerApiVersion: Short
     ): Either[Err, Map[TopicAndPartition, Long]] = {
-    getConsumerOffsetMetadata(groupId, topicAndPartitions).right.map { r =>
+    getConsumerOffsetMetadata(groupId, topicAndPartitions, consumerApiVersion).right.map { r =>
       r.map { kv =>
         kv._1 -> kv._2.offset
       }
     }
   }
 
-  /** Requires Kafka >= 0.8.1.1 */
+  /** Requires Kafka >= 0.8.1.1.  Defaults to the original ZooKeeper backed api version. */
   def getConsumerOffsetMetadata(
       groupId: String,
       topicAndPartitions: Set[TopicAndPartition]
+    ): Either[Err, Map[TopicAndPartition, OffsetMetadataAndError]] =
+    getConsumerOffsetMetadata(groupId, topicAndPartitions, defaultConsumerApiVersion)
+
+  def getConsumerOffsetMetadata(
+      groupId: String,
+      topicAndPartitions: Set[TopicAndPartition],
+      consumerApiVersion: Short
     ): Either[Err, Map[TopicAndPartition, OffsetMetadataAndError]] = {
     var result = Map[TopicAndPartition, OffsetMetadataAndError]()
-    val req = OffsetFetchRequest(groupId, topicAndPartitions.toSeq)
+    val req = OffsetFetchRequest(groupId, topicAndPartitions.toSeq, consumerApiVersion)
     val errs = new Err
     withBrokers(Random.shuffle(config.seedBrokers), errs) { consumer =>
       val resp = consumer.fetchOffsets(req)
@@ -262,28 +287,43 @@ class KafkaCluster(val kafkaParams: Map[String, String]) extends Serializable {
     Left(errs)
   }
 
-  /** Requires Kafka >= 0.8.1.1 */
+  /** Requires Kafka >= 0.8.1.1.  Defaults to the original ZooKeeper backed api version. */
   def setConsumerOffsets(
       groupId: String,
       offsets: Map[TopicAndPartition, Long]
+    ): Either[Err, Map[TopicAndPartition, Short]] =
+    setConsumerOffsets(groupId, offsets, defaultConsumerApiVersion)
+
+  def setConsumerOffsets(
+      groupId: String,
+      offsets: Map[TopicAndPartition, Long],
+      consumerApiVersion: Short
     ): Either[Err, Map[TopicAndPartition, Short]] = {
-    setConsumerOffsetMetadata(groupId, offsets.map { kv =>
-      kv._1 -> OffsetMetadataAndError(kv._2)
-    })
+    val meta = offsets.map { kv =>
+      kv._1 -> OffsetAndMetadata(kv._2)
+    }
+    setConsumerOffsetMetadata(groupId, meta, consumerApiVersion)
   }
 
-  /** Requires Kafka >= 0.8.1.1 */
+  /** Requires Kafka >= 0.8.1.1.  Defaults to the original ZooKeeper backed api version. */
   def setConsumerOffsetMetadata(
       groupId: String,
-      metadata: Map[TopicAndPartition, OffsetMetadataAndError]
+      metadata: Map[TopicAndPartition, OffsetAndMetadata]
+    ): Either[Err, Map[TopicAndPartition, Short]] =
+    setConsumerOffsetMetadata(groupId, metadata, defaultConsumerApiVersion)
+
+  def setConsumerOffsetMetadata(
+      groupId: String,
+      metadata: Map[TopicAndPartition, OffsetAndMetadata],
+      consumerApiVersion: Short
     ): Either[Err, Map[TopicAndPartition, Short]] = {
     var result = Map[TopicAndPartition, Short]()
-    val req = OffsetCommitRequest(groupId, metadata)
+    val req = OffsetCommitRequest(groupId, metadata, consumerApiVersion)
     val errs = new Err
     val topicAndPartitions = metadata.keySet
     withBrokers(Random.shuffle(config.seedBrokers), errs) { consumer =>
       val resp = consumer.commitOffsets(req)
-      val respMap = resp.requestInfo
+      val respMap = resp.commitStatus
       val needed = topicAndPartitions.diff(result.keySet)
       needed.foreach { tp: TopicAndPartition =>
         respMap.get(tp).foreach { err: Short =>
@@ -323,11 +363,18 @@ class KafkaCluster(val kafkaParams: Map[String, String]) extends Serializable {
   }
 }
 
-private[spark]
+@DeveloperApi
 object KafkaCluster {
   type Err = ArrayBuffer[Throwable]
 
-  private[spark]
+  /** If the result is right, return it, otherwise throw SparkException */
+  def checkErrors[T](result: Either[Err, T]): T = {
+    result.fold(
+      errs => throw new SparkException(errs.mkString("\n")),
+      ok => ok
+    )
+  }
+
   case class LeaderOffset(host: String, port: Int, offset: Long)
 
   /**
@@ -335,19 +382,17 @@ object KafkaCluster {
    * Simple consumers connect directly to brokers, but need many of the same configs.
    * This subclass won't warn about missing ZK params, or presence of broker params.
    */
-  private[spark]
   class SimpleConsumerConfig private(brokers: String, originalProps: Properties)
       extends ConsumerConfig(originalProps) {
     val seedBrokers: Array[(String, Int)] = brokers.split(",").map { hp =>
       val hpa = hp.split(":")
       if (hpa.size == 1) {
-        throw new SparkException(s"Broker not the in correct format of <host>:<port> [$brokers]")
+        throw new SparkException(s"Broker not in the correct format of <host>:<port> [$brokers]")
       }
       (hpa(0), hpa(1).toInt)
     }
   }
 
-  private[spark]
   object SimpleConsumerConfig {
     /**
      * Make a consumer config without requiring group.id or zookeeper.connect,
@@ -369,7 +414,7 @@ object KafkaCluster {
       }
 
       Seq("zookeeper.connect", "group.id").foreach { s =>
-        if (!props.contains(s)) {
+        if (!props.containsKey(s)) {
           props.setProperty(s, "")
         }
       }
